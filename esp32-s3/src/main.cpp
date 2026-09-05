@@ -5,9 +5,17 @@
 #include <ArduinoOTA.h>
 #include <TelnetStream.h>
 #include <ESPmDNS.h>
+#include <secrets.hpp>
 
-const char* ssid = "xxx";
-const char* password = "xxx";
+#ifndef SSID
+#define SSID "default_ssid"
+#endif
+
+#ifndef SSID_PASSWORD
+#define SSID_PASSWORD "default_password"
+#endif
+
+
 WiFiServer server(2137);
 
 void logPrint(const String& msg) {
@@ -21,7 +29,6 @@ void logPrintln(const String& msg) {
 
 void setupOTA() {
   ArduinoOTA.setHostname("esp32s3");
-  ArduinoOTA.setPassword("admin123");
 
   ArduinoOTA.onStart([]() {
     String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
@@ -82,8 +89,8 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  Serial.printf("Connecting to %s", ssid);
-  WiFi.begin(ssid, password);
+  Serial.printf("Connecting to %s", SSID);
+  WiFi.begin(SSID, SSID_PASSWORD);
 
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -101,8 +108,9 @@ void setup() {
   if (MDNS.begin("esp32s3")) {
     Serial.println("\nmDNS responder started: esp32s3.local");
   }
+
   // (Optional) Advertise what services the ESP provides
-  MDNS.addService("http", "tcp", 80);
+  MDNS.addService("piano-tracker", "tcp", 2137);
   MDNS.addService("telnet", "tcp", 23);
 
   server.begin();
@@ -118,10 +126,8 @@ void listen_for_user() {
 
   if(!client.connected()) {
       return;
-  }
-
-  
- }
+  } 
+}
 
 void loop() {
   // OTA must be handled continuously on every loop iteration
@@ -131,30 +137,6 @@ void loop() {
   static unsigned long lastCheck = 0;
   if (millis() - lastCheck >= 5000) {
     lastCheck = millis();
-
-    logPrintln("\n--- Checking Connectivity ---");
-
-    if (isWiFiConnected()) {
-      Serial.printf("[OK] Wi-Fi connected (RSSI: %d dBm)\n", WiFi.RSSI());
-    } else {
-      logPrintln("[FAIL] Wi-Fi disconnected!");
-    }
-
-    if (isDnsWorking()) {
-      logPrintln("[OK] DNS resolution functional");
-    } else {
-      logPrintln("[FAIL] DNS lookup failed");
-    }
-
-    if (hasInternetAccess()) {
-      logPrintln("[OK] Active Internet access confirmed (HTTP 204)");
-      neopixelWrite(38, 0, 50, 0); // Green LED on GPIO 38
-      logPrintln(WiFi.localIP().toString());
-    } else {
-        logPrintln("[FAIL] No active internet access");
-        neopixelWrite(38, 50, 0, 0); // Red LED on GPIO 38
-    }
-
-    ping_me();
+    logPrintln("Hello");
   }
 }
