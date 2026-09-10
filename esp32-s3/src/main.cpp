@@ -218,6 +218,8 @@ void loop() {
   if (millis() - lastCheck >= 5000) {
     lastCheck = millis();
     logPrintln("Im alive btw " + String(counter++));
+    logPrintf("[USB] Host Control Transfer Max Size: %d bytes\n",
+              CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE);
   }
   handle_new_user();
   server_user();

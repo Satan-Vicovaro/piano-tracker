@@ -4,3 +4,9 @@
 .vscode/launch.json
 .vscode/ipch
 secrets.hpp
+.dummy
+managed_components
+CMakeLists.txt
+dependencies.lock
+sdkconfig.defaults
+sdkconfig.esp32-s3-devkitc-1
