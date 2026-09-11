@@ -300,7 +300,16 @@ void handle_network_client() {
       String cmd = String(buffer);
       cmd.trim();
 
-      if (cmd.equalsIgnoreCase("mode echo")) {
+      if (cmd.equalsIgnoreCase("status")) {
+        if (currentMode == ServerMode::ECHO) {
+          activeClient.printf("Mode: ECHO\n");
+        } else if (currentMode == ServerMode::PIANO_NOTES) {
+          activeClient.printf("Mode: PIANO NOTES\n");
+        } else {
+          activeClient.printf("Mode: UNKNOWN\n");
+        }
+        activeClient.printf("Buffer size: %d\n", noteQueue.count);
+      } else if (cmd.equalsIgnoreCase("mode echo")) {
         rgbLedWrite(38, 50, 0, 0);
         currentMode = ServerMode::ECHO;
         activeClient.println("OK: mode set to echo");
