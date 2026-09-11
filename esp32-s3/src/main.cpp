@@ -17,11 +17,78 @@
 #define SSID_PASSWORD "default_password"
 #endif
 
-WiFiServer server(2137);
+#define BUFFER_SIZE 256
 
-#define MAX_CLIENT_COUNT 4
-WiFiClient clients[MAX_CLIENT_COUNT];
-bool clientActive[MAX_CLIENT_COUNT] = {false};
+#pragma pack(push, 1)
+enum NoteType : uint8_t { UP, DOWN, UNKNOWN };
+struct PianoData {
+  uint8_t note;
+  uint8_t velocity;
+  NoteType type;
+};
+#pragma pack(pop)
+
+enum class ServerMode : uint8_t { ECHO, PIANO_NOTES };
+
+struct CyclicQueue {
+  PianoData data[BUFFER_SIZE];
+  size_t head = 0;
+  size_t tail = 0;
+  size_t count = 0;
+  portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+  bool push(const PianoData& item) {
+    portENTER_CRITICAL(&mux);
+    if (count >= BUFFER_SIZE) {
+      tail = (tail + 1) % BUFFER_SIZE;
+      count--;
+    }
+    data[head] = item;
+    head = (head + 1) % BUFFER_SIZE;
+    count++;
+    portEXIT_CRITICAL(&mux);
+    return true;
+  }
+
+  bool pop(PianoData* out) {
+    portENTER_CRITICAL(&mux);
+    if (count == 0) {
+      portEXIT_CRITICAL(&mux);
+      return false;
+    }
+    *out = data[tail];
+    tail = (tail + 1) % BUFFER_SIZE;
+    count--;
+    portEXIT_CRITICAL(&mux);
+    return true;
+  }
+
+  size_t size() {
+    portENTER_CRITICAL(&mux);
+    size_t c = count;
+    portEXIT_CRITICAL(&mux);
+    return c;
+  }
+};
+
+CyclicQueue noteQueue;
+
+void appendPianoData(PianoData* data) {
+  if (data != nullptr) {
+    noteQueue.push(*data);
+  }
+}
+
+bool popData(PianoData* data) {
+  if (data == nullptr) {
+    return false;
+  }
+  return noteQueue.pop(data);
+}
+
+WiFiServer server(2137);
+WiFiClient activeClient;
+ServerMode currentMode = ServerMode::ECHO;
 
 static const char* NOTE_NAMES[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
 
@@ -30,7 +97,7 @@ EspUsbHost usb;
 void logPrintf(const char* format, ...) __attribute__((format(printf, 1, 2)));
 
 void logPrintf(const char* format, ...) {
-  char buffer[256];  // Buffer for formatted string
+  char buffer[256];
   va_list args;
   va_start(args, format);
   vsnprintf(buffer, sizeof(buffer), format, args);
@@ -54,37 +121,52 @@ void printNoteName(uint8_t noteNumber) {
   logPrintf("%s%d (MIDI %d)\n", NOTE_NAMES[noteIndex], octave, noteNumber);
 }
 
-void handleMidiMessage(const EspUsbHostMidiMessage& msg) {
-  uint8_t type = msg.status & 0xF0;           // Command (0x90 = Note On, 0x80 = Note Off)
-  uint8_t channel = (msg.status & 0x0F) + 1;  // Channels 1 - 16
-  uint8_t note = msg.data1;                   // Pitch (0 - 127)
-  uint8_t vel = msg.data2;                    // Velocity (0 - 127)
+void processMidiEvent(uint8_t channel, uint8_t type, uint8_t note, uint8_t vel) {
+  NoteType noteType = UNKNOWN;
+
   switch (type) {
     case 0x90:  // Note On
       if (vel == 0) {
-        // Many pianos send Note On with velocity 0 instead of Note Off
+        noteType = UP;
         logPrintf("[Ch %d] Note OFF: ", channel);
         printNoteName(note);
       } else {
+        noteType = DOWN;
         logPrintf("[Ch %d] Note ON:  ", channel);
         printNoteName(note);
         logPrintf(" | Velocity: %d\n", vel);
       }
       break;
+
     case 0x80:  // Note Off
+      noteType = UP;
       logPrintf("[Ch %d] Note OFF: ", channel);
       printNoteName(note);
       logPrintf(" | Release Vel: %d\n", vel);
       break;
+
     case 0xB0:           // Control Change (Sustain Pedal, Expression, etc.)
       if (note == 64) {  // CC 64 is Damper / Sustain Pedal
         logPrintf("[Ch %d] Sustain Pedal: %s (%d)\n", channel, (vel >= 64) ? "DOWN" : "UP", vel);
       }
+      noteType = UNKNOWN;
       break;
 
     default:
-      break;
+      return;  // Ignore unsupported MIDI messages (Clock, SysEx, Pitch Bend, etc.)
   }
+
+  PianoData data = {note, vel, noteType};
+  appendPianoData(&data);
+}
+
+void handleMidiMessage(const EspUsbHostMidiMessage& msg) {
+  uint8_t type = msg.status & 0xF0;  // Command (0x90 = Note On, 0x80 = Note Off, 0xB0 = CC)
+  uint8_t channel = (msg.status & 0x0F) + 1;  // Channels 1 - 16
+  uint8_t note = msg.data1;                   // Pitch (0 - 127) or CC number
+  uint8_t vel = msg.data2;                    // Velocity (0 - 127) or CC value
+
+  processMidiEvent(channel, type, note, vel);
 }
 
 void setupOTA() {
@@ -165,64 +247,98 @@ void setup() {
   logPrintln("Usb host on");
 }
 
-void handle_new_user() {
-  WiFiClient newClient = server.available();
-  bool slotFound = false;
+void processModeCommand(const String& cmd, const char* buffer, int bytesRead) {
+  switch (currentMode) {
+    case ServerMode::ECHO:
+      activeClient.write((const uint8_t*)buffer, bytesRead);
+      break;
 
-  if (!newClient.connected()) {
+    case ServerMode::PIANO_NOTES:
+      if (cmd.equalsIgnoreCase("notes")) {
+        uint16_t countHeader = (uint16_t)noteQueue.size();
+        activeClient.write((const uint8_t*)&countHeader, sizeof(countHeader));
+
+        PianoData data;
+        while (popData(&data)) {
+          activeClient.write((const uint8_t*)&data, sizeof(PianoData));
+        }
+      } else {
+        activeClient.println(
+            "ERR: Unknown command in piano_notes mode. Commands: 'notes', 'mode "
+            "<echo|piano_notes>'");
+      }
+      break;
+  }
+}
+
+void handle_network_client() {
+  if (!activeClient.connected()) {
+    WiFiClient newClient = server.available();
+    if (newClient) {
+      activeClient = newClient;
+      currentMode = ServerMode::ECHO;
+      logPrintln("[TCP] Client connected! Default mode: ECHO");
+    }
     return;
   }
 
-  for (int i = 0; i < MAX_CLIENT_COUNT; i++) {
-    if (!clientActive[i]) {
-      clients[i] = newClient;
-      clientActive[i] = true;
-      logPrintln(String("Client connected!") + String(i));
-      slotFound = true;
-      break;
+  WiFiClient extraClient = server.available();
+  if (extraClient) {
+    extraClient.println("ERR: Server busy. Only 1 receiver allowed.");
+    extraClient.stop();
+    logPrintln("[TCP] Rejected secondary client: only 1 receiver allowed");
+  }
+
+  int avail = activeClient.available();
+  if (avail > 0) {
+    char buffer[256];
+    int toRead = std::min(avail, (int)sizeof(buffer) - 1);
+    int bytesRead = activeClient.read((uint8_t*)buffer, toRead);
+    if (bytesRead > 0) {
+      buffer[bytesRead] = '\0';
+
+      String cmd = String(buffer);
+      cmd.trim();
+
+      if (cmd.equalsIgnoreCase("mode echo")) {
+        rgbLedWrite(38, 50, 0, 0);
+        currentMode = ServerMode::ECHO;
+        activeClient.println("OK: mode set to echo");
+        logPrintln("[Server] Mode set to ECHO");
+      } else if (cmd.equalsIgnoreCase("mode piano_notes")) {
+        rgbLedWrite(38, 0, 50, 0);
+        currentMode = ServerMode::PIANO_NOTES;
+        activeClient.println("OK: mode set to piano_notes");
+        logPrintln("[Server] Mode set to PIANO_NOTES");
+      } else if (cmd.equalsIgnoreCase("mode")) {
+        if (currentMode == ServerMode::ECHO) {
+          activeClient.println("MODE: echo");
+        } else {
+          activeClient.println("MODE: piano_notes");
+        }
+      } else {
+        processModeCommand(cmd, buffer, bytesRead);
+      }
     }
   }
 
-  if (!slotFound) {
-    newClient.println("Server is busy. Try again later.");
-    newClient.stop();
-    logPrintln("Rejected client: server full");
-  }
-  neopixelWrite(38, 50, 0, 0);  // Red LED on GPIO 38
-}
-
-void server_user() {
-  static char buffer[1024];
-  for (int i = 0; i < MAX_CLIENT_COUNT; i++) {
-    if (clientActive[i]) {
-      while (clients[i].available()) {
-        int readBytes = clients[i].readBytes(buffer, sizeof(buffer));
-        clients[i].write(buffer, readBytes);
-      }
-      if (!clients[i].connected()) {
-        clients[i].stop();
-        clientActive[i] = false;
-        logPrintln(String("Client disconnected: ") + String(i));
-      }
-    }
+  // 4. Check for client disconnection
+  if (!activeClient.connected()) {
+    activeClient.stop();
+    currentMode = ServerMode::ECHO;
+    logPrintln("[TCP] Client disconnected");
   }
 }
 
 int counter = 0;
-int clientCount = 0;
 
 void loop() {
   ArduinoOTA.handle();
 
   static unsigned long lastCheck = 0;
-  if (millis() - lastCheck >= 5000) {
+  if (millis() - lastCheck >= 30000) {
     lastCheck = millis();
-    logPrintln("Im alive btw " + String(counter++));
-    logPrintf("[USB] Host Control Transfer Max Size: %d bytes\n",
-              CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE);
+    logPrintf("I'm alive btw: %d\n", counter++);
   }
-  handle_new_user();
-  server_user();
-
-  neopixelWrite(38, 1, 1, 1);  // Red LED on GPIO 38
+  handle_network_client();
 }
